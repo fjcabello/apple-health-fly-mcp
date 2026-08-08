@@ -570,6 +570,19 @@ _HAE_METRIC_MAP = {
 _INGEST_SECRET = os.environ.get("INTERNAL_SECRET", "")
 _LAST_PAYLOAD_PATH = DATA_DIR / "_last_ingest_payload.json"
 
+# Health Auto Export's sleep_analysis sends one row per night with daily
+# aggregate hours per stage, unlike our per-interval "sleep" parquet schema
+# (one row per stage-interval, value = raw HK category string). We synthesize
+# one synthetic interval per stage per night to bridge the two formats.
+_HAE_SLEEP_STAGE_MAP = {
+    "core":   "HKCategoryValueSleepAnalysisAsleepCore",
+    "deep":   "HKCategoryValueSleepAnalysisAsleepDeep",
+    "rem":    "HKCategoryValueSleepAnalysisAsleepREM",
+    "awake":  "HKCategoryValueSleepAnalysisAwake",
+    "asleep": "HKCategoryValueSleepAnalysisAsleepUnspecified",
+    "inBed":  "HKCategoryValueSleepAnalysisInBed",
+}
+
 
 def _check_ingest_auth(request) -> bool:
     api_key = request.headers.get("x-api-key") or request.query_params.get("api_key", "")
@@ -613,6 +626,32 @@ def _hae_qty(value) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _upsert_sleep(new_rows: list[dict]) -> int:
+    """Merge synthetic per-stage sleep rows into sleep.parquet, dedup by startDate.
+    Unlike _upsert_parquet, "value" stays a category string (not coerced to numeric)."""
+    if not new_rows:
+        return 0
+
+    new_df = pd.DataFrame(new_rows)
+    new_df["startDate"] = pd.to_datetime(new_df["startDate"], utc=True, errors="coerce")
+    new_df["endDate"]   = pd.to_datetime(new_df["endDate"],   utc=True, errors="coerce")
+
+    path = DATA_DIR / "sleep.parquet"
+    if path.exists():
+        existing = pd.read_parquet(path)
+        existing["startDate"] = pd.to_datetime(existing["startDate"], utc=True, errors="coerce")
+        combined = pd.concat([existing, new_df], ignore_index=True)
+        combined = combined.drop_duplicates(subset=["startDate"], keep="last")
+    else:
+        combined = new_df
+
+    combined = combined.sort_values("startDate")
+    combined.to_parquet(path, index=False)
+
+    added = len(combined) - (len(existing) if path.exists() else 0)
+    return max(added, 0)
 
 
 def _upsert_workouts(new_rows: list[dict]) -> int:
@@ -668,6 +707,42 @@ async def ingest_handler(request):
     metrics = data_root.get("metrics", [])
     for metric in metrics:
         hae_name = metric.get("name", "")
+
+        if hae_name == "sleep_analysis":
+            sleep_rows = []
+            for sample in metric.get("data", []):
+                date_str = sample.get("date")
+                # Keep the original local offset (not utc=True) so the calendar date
+                # matches HAE's own "date" field — converting midnight-local straight
+                # to UTC would shift it to the previous day.
+                night = pd.to_datetime(date_str, errors="coerce") if date_str else None
+                if night is None or pd.isna(night):
+                    continue
+                night_date = night.date().isoformat()
+                source = sample.get("source", "HealthAutoExport")
+                # Anchor each stage at hour>=12 on the night's own date so get_sleep's
+                # night-attribution formula (hour<12 -> previous day) keeps it on this
+                # same calendar date, matching HAE's own "date" field for the night.
+                for i, (hae_field, hk_value) in enumerate(_HAE_SLEEP_STAGE_MAP.items()):
+                    hours = _hae_qty(sample.get(hae_field))
+                    if not hours:
+                        continue
+                    start = pd.Timestamp(f"{night_date} 22:00:00", tz="UTC") + pd.Timedelta(minutes=i)
+                    end = start + pd.Timedelta(hours=hours)
+                    sleep_rows.append({
+                        "startDate":  start.isoformat(),
+                        "endDate":    end.isoformat(),
+                        "value":      hk_value,
+                        "unit":       "",
+                        "sourceName": source,
+                        "date":       night_date,
+                    })
+
+            added = _upsert_sleep(sleep_rows)
+            if sleep_rows:
+                updated["sleep"] = added
+            continue
+
         short = _HAE_METRIC_MAP.get(hae_name)
         if not short:
             continue
