@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+data/
+../apple_health_export/
+*.xml
+.fly_secret_local
