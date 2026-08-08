@@ -629,29 +629,31 @@ def _hae_qty(value) -> Optional[float]:
 
 
 def _upsert_sleep(new_rows: list[dict]) -> int:
-    """Merge synthetic per-stage sleep rows into sleep.parquet, dedup by startDate.
-    Unlike _upsert_parquet, "value" stays a category string (not coerced to numeric)."""
+    """Replace sleep.parquet rows for the nights present in new_rows with synthetic
+    per-stage rows derived from HAE's daily aggregate. Unlike _upsert_parquet, "value"
+    stays a category string (not coerced to numeric), and replacement is by "date"
+    (whole night), not by exact startDate, since synthetic and XML-derived intervals
+    for the same night would otherwise coexist and double-count the totals."""
     if not new_rows:
         return 0
 
     new_df = pd.DataFrame(new_rows)
     new_df["startDate"] = pd.to_datetime(new_df["startDate"], utc=True, errors="coerce")
     new_df["endDate"]   = pd.to_datetime(new_df["endDate"],   utc=True, errors="coerce")
+    nights = set(new_df["date"])
 
     path = DATA_DIR / "sleep.parquet"
     if path.exists():
         existing = pd.read_parquet(path)
         existing["startDate"] = pd.to_datetime(existing["startDate"], utc=True, errors="coerce")
+        existing = existing[~existing["date"].isin(nights)]  # drop old rows for these nights
         combined = pd.concat([existing, new_df], ignore_index=True)
-        combined = combined.drop_duplicates(subset=["startDate"], keep="last")
     else:
         combined = new_df
 
     combined = combined.sort_values("startDate")
     combined.to_parquet(path, index=False)
-
-    added = len(combined) - (len(existing) if path.exists() else 0)
-    return max(added, 0)
+    return len(new_df)
 
 
 def _upsert_workouts(new_rows: list[dict]) -> int:
