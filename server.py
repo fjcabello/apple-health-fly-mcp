@@ -125,6 +125,25 @@ def _load_metric_frame(
     df = pd.read_parquet(path, filters=filters or None)
     df["startDate"] = pd.to_datetime(df["startDate"], utc=True, errors="coerce")
     df["endDate"]   = pd.to_datetime(df["endDate"],   utc=True, errors="coerce")
+
+    # `unit` and `sourceName` repeat a handful of distinct values across
+    # every row (e.g. heart_rate.parquet: 1 distinct unit, 4 distinct
+    # sourceName, over 1.69M rows) — category dtype stores each value once
+    # instead of a full Python string object per row. `date` gets the same
+    # treatment but needs to stay ordered, since _filter_dates compares it
+    # with >=/<=; plain (unordered) categoricals raise on that.
+    for col in ("unit", "sourceName"):
+        if col in df.columns:
+            df[col] = df[col].astype("category")
+    if "date" in df.columns:
+        df["date"] = df["date"].astype("category").cat.as_ordered()
+
+    # `value` is numeric for every metric except sleep (a category string
+    # like HKCategoryValueSleepAnalysisAsleepCore) — float32 halves that
+    # column's memory with no meaningful precision loss for steps/bpm/kg/etc.
+    if "value" in df.columns and pd.api.types.is_float_dtype(df["value"]):
+        df["value"] = df["value"].astype("float32")
+
     return df
 
 
