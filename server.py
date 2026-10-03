@@ -4,6 +4,7 @@ Loads preprocessed Parquet files (run preprocess.py first) for fast startup.
 Falls back to parsing the XML directly if Parquet files are not found.
 """
 
+import hmac
 import os
 import sys
 from pathlib import Path
@@ -710,8 +711,10 @@ _HAE_SLEEP_STAGE_MAP = {
 
 
 def _check_ingest_auth(request) -> bool:
+    if not _INGEST_SECRET:
+        return False
     api_key = request.headers.get("x-api-key") or request.query_params.get("api_key", "")
-    return not _INGEST_SECRET or api_key == _INGEST_SECRET
+    return hmac.compare_digest(api_key.encode(), _INGEST_SECRET.encode())
 
 
 def _upsert_parquet(short: str, new_rows: list[dict]) -> int:

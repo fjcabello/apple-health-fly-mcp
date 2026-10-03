@@ -13,7 +13,11 @@ header or api_key query param, checked against INTERNAL_SECRET) since the
 iOS app calls Fly directly and can only set a header, not our query param.
 """
 
+import copy
+import hmac
+import logging
 import os
+import re
 import sys
 from pathlib import Path
 from urllib.parse import parse_qsl
@@ -33,8 +37,24 @@ if not API_KEY:
 DATA_DIR = Path(os.environ.get("APPLE_HEALTH_DATA_DIR", "/data"))
 
 
+def _valid_key(provided: str | None) -> bool:
+    return hmac.compare_digest((provided or "").encode(), API_KEY.encode())
+
+
+class RedactApiKey(logging.Filter):
+    """Mask api_key query values in uvicorn access-log lines."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                re.sub(r"(api_key=)[^&\s]+", r"\1***", a) if isinstance(a, str) else a
+                for a in record.args
+            )
+        return True
+
+
 async def upload_file(request: Request) -> PlainTextResponse:
-    if request.query_params.get("api_key") != API_KEY:
+    if not _valid_key(request.query_params.get("api_key")):
         return PlainTextResponse("Unauthorized", status_code=401)
     filename = request.path_params["filename"]
     if "/" in filename or "\\" in filename or filename.startswith("."):
@@ -51,7 +71,7 @@ async def upload_file(request: Request) -> PlainTextResponse:
 
 
 async def reload_data(request: Request) -> JSONResponse:
-    if request.query_params.get("api_key") != API_KEY:
+    if not _valid_key(request.query_params.get("api_key")):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     _cache.clear()
     return JSONResponse({"ok": True, "reloaded": True})
@@ -72,11 +92,10 @@ class RootApp:
       everything else (incl. /mcp) -> mcp_app, requires ?api_key=
     """
 
-    def __init__(self, mcp_app: object, admin_app: object, ingest_app: object, api_key: str) -> None:
+    def __init__(self, mcp_app: object, admin_app: object, ingest_app: object) -> None:
         self.mcp_app = mcp_app
         self.admin_app = admin_app
         self.ingest_app = ingest_app
-        self.api_key = api_key
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -89,7 +108,7 @@ class RootApp:
             return
 
         params = dict(parse_qsl(scope.get("query_string", b"").decode()))
-        if params.get("api_key") != self.api_key:
+        if not _valid_key(params.get("api_key")):
             response = JSONResponse({"error": "Unauthorized"}, status_code=401)
             await response(scope, receive, send)
             return
@@ -101,10 +120,14 @@ class RootApp:
         await self.mcp_app(scope, receive, send)
 
 
-app = RootApp(mcp_app, admin_app, ingest_app, API_KEY)
+app = RootApp(mcp_app, admin_app, ingest_app)
 
 
 if __name__ == "__main__":
     import uvicorn
+    from uvicorn.config import LOGGING_CONFIG
 
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    log_config = copy.deepcopy(LOGGING_CONFIG)
+    log_config["filters"] = {"redact_api_key": {"()": RedactApiKey}}
+    log_config["handlers"]["access"]["filters"] = ["redact_api_key"]
+    uvicorn.run(app, host="0.0.0.0", port=8080, log_config=log_config)
