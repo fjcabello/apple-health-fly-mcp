@@ -11,6 +11,8 @@ from collections import defaultdict
 from typing import Optional
 
 import pandas as pd
+import pyarrow.parquet as pq
+import pyarrow.compute as pc
 from mcp.server.fastmcp import FastMCP
 
 from config import HK_TYPE_MAP, SHORT_NAMES, SLEEP_VALUES, CATEGORY_TYPES
@@ -37,16 +39,24 @@ _cache: dict = {}
 
 def _load_data() -> dict:
     """
-    Load data from Parquet files (fast). Falls back to parsing XML if
-    Parquet files don't exist — run preprocess.py to generate them.
+    Ensure the cache skeleton (workouts + profile info) is initialized.
+    Falls back to parsing the XML if Parquet files don't exist — run
+    preprocess.py to generate them.
+
+    Individual metric frames are NOT loaded here — they're loaded lazily,
+    one Parquet file at a time, by _get_frame(). Eagerly loading all ~22
+    metrics (2.9M+ rows combined, including high-frequency ones like
+    per-minute headphone audio exposure) used to pull the whole dataset
+    into memory on the very first tool call, even for queries that only
+    ever touch one metric (e.g. body weight).
     """
-    if _cache:
+    if _cache.get("_initialized"):
         return _cache
 
     parquet_available = DATA_DIR.exists() and any(DATA_DIR.glob("*.parquet"))
 
     if parquet_available:
-        _load_from_parquet()
+        _init_from_parquet()
     else:
         print(
             "[apple-health-mcp] No Parquet files found. "
@@ -58,22 +68,11 @@ def _load_data() -> dict:
     return _cache
 
 
-def _load_from_parquet() -> None:
-    """Load all Parquet files from DATA_DIR into _cache."""
-    import time
-    t0 = time.time()
-    print(f"[apple-health-mcp] Loading from Parquet: {DATA_DIR}", file=sys.stderr)
-
-    frames: dict[str, pd.DataFrame] = {}
-    for short in SHORT_NAMES:
-        path = DATA_DIR / f"{short}.parquet"
-        if path.exists():
-            df = pd.read_parquet(path)
-            # Restore datetime columns
-            df["startDate"] = pd.to_datetime(df["startDate"], utc=True, errors="coerce")
-            df["endDate"]   = pd.to_datetime(df["endDate"],   utc=True, errors="coerce")
-            # date col is stored as str in Parquet — keep as str for filtering
-            frames[short] = df
+def _init_from_parquet() -> None:
+    """Load workouts + profile info (small, always needed) from DATA_DIR.
+    Metric frames start as an empty dict and are filled on demand by
+    _get_frame()."""
+    print(f"[apple-health-mcp] Initializing from Parquet: {DATA_DIR}", file=sys.stderr)
 
     workout_path = DATA_DIR / "workouts.parquet"
     workout_df = pd.DataFrame()
@@ -87,12 +86,62 @@ def _load_from_parquet() -> None:
     if me_path.exists():
         me_info = pd.read_parquet(me_path).iloc[0].to_dict()
 
-    _cache["frames"]   = frames
-    _cache["workouts"] = workout_df
-    _cache["me"]       = me_info
+    _cache["frames"]       = {}
+    _cache["workouts"]     = workout_df
+    _cache["me"]           = me_info
+    _cache["_initialized"] = True
 
-    total = sum(len(v) for v in frames.values())
-    print(f"[apple-health-mcp] Loaded {total:,} records in {time.time()-t0:.2f}s", file=sys.stderr)
+    print(
+        f"[apple-health-mcp] Ready ({len(workout_df):,} workouts). "
+        "Metric data loads lazily per-request.",
+        file=sys.stderr,
+    )
+
+
+def _load_metric_frame(
+    short: str,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> Optional[pd.DataFrame]:
+    """Read a single metric's Parquet file from disk. Returns None if the
+    file doesn't exist. Not cached here — the caller (_get_frame) does that.
+
+    When start/end are given, the date filter is pushed down to the Parquet
+    read itself (pyarrow row-group pruning via the `filters` kwarg) instead
+    of loading the whole file and filtering in pandas afterwards. The files
+    are written sorted by startDate (see _upsert_parquet), so row groups
+    outside the requested range are skipped entirely rather than just read
+    and discarded — this is what actually saves memory for metrics with
+    years of history (steps, heart rate, headphone audio, ...).
+    """
+    path = DATA_DIR / f"{short}.parquet"
+    if not path.exists():
+        return None
+    filters = []
+    if start:
+        filters.append(("date", ">=", start))
+    if end:
+        filters.append(("date", "<=", end))
+    df = pd.read_parquet(path, filters=filters or None)
+    df["startDate"] = pd.to_datetime(df["startDate"], utc=True, errors="coerce")
+    df["endDate"]   = pd.to_datetime(df["endDate"],   utc=True, errors="coerce")
+    return df
+
+
+def _parquet_quick_stats(short: str) -> Optional[tuple[int, str, str]]:
+    """Row count and date range for a metric's Parquet file, read via
+    pyarrow without building a full pandas DataFrame or going through the
+    (now lazy) frame cache. Used by health_summary(), which otherwise would
+    force every metric to load fully into memory just to print a table."""
+    path = DATA_DIR / f"{short}.parquet"
+    if not path.exists():
+        return None
+    table = pq.read_table(path, columns=["date"])
+    n = table.num_rows
+    if n == 0:
+        return None
+    col = table.column("date")
+    return n, str(pc.min(col).as_py()), str(pc.max(col).as_py())
 
 
 def _load_from_xml() -> None:
@@ -177,9 +226,28 @@ def _load_from_xml() -> None:
     print(f"[apple-health-mcp] Loaded {total:,} records in {time.time()-t0:.1f}s", file=sys.stderr)
 
 
-def _get_frame(short_name: str) -> Optional[pd.DataFrame]:
+def _get_frame(
+    short_name: str,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> Optional[pd.DataFrame]:
+    """Return a metric's DataFrame.
+
+    Without a date range, loads the full metric once and caches it for the
+    life of the process (several tools reuse it across a session). With a
+    date range, reads only the matching rows straight from Parquet via
+    _load_metric_frame and does NOT touch the cache — caching every distinct
+    range a caller might ask for would just reintroduce the memory problem
+    this is meant to avoid, and re-reading a pruned Parquet slice is cheap.
+    """
+    if start or end:
+        return _load_metric_frame(short_name, start, end)
+
     data = _load_data()
-    return data["frames"].get(short_name)
+    frames = data["frames"]
+    if short_name not in frames:
+        frames[short_name] = _load_metric_frame(short_name)
+    return frames[short_name]
 
 
 def _filter_dates(df: pd.DataFrame, start: Optional[str], end: Optional[str]) -> pd.DataFrame:
@@ -226,7 +294,6 @@ def health_summary() -> str:
     types available, total record counts, and date range.
     """
     data = _load_data()
-    frames = data["frames"]
     me = data["me"]
     workouts = data["workouts"]
 
@@ -241,12 +308,13 @@ def health_summary() -> str:
     lines.append(f"{'Data type':<45} {'Records':>10}  {'From':<12}  {'To':<12}")
     lines.append("-" * 85)
 
+    # Row counts/date ranges come from Parquet metadata (_parquet_quick_stats),
+    # not from _get_frame — pulling every metric through the full frame cache
+    # just to print this table would defeat the point of loading lazily.
     for short in SHORT_NAMES:
-        df = frames.get(short)
-        if df is not None and not df.empty:
-            n   = len(df)
-            lo  = str(df["date"].min())
-            hi  = str(df["date"].max())
+        stats = _parquet_quick_stats(short)
+        if stats:
+            n, lo, hi = stats
             lines.append(f"{short:<45} {n:>10,}  {lo:<12}  {hi:<12}")
 
     if not workouts.empty:
@@ -268,7 +336,7 @@ def get_steps(
     Returns step counts aggregated by granularity: daily (default), weekly, monthly, or yearly.
     Optionally filter by start_date and/or end_date (YYYY-MM-DD).
     """
-    df = _get_frame("steps")
+    df = _get_frame("steps", start_date, end_date)
     if df is None or df.empty:
         return "No step data available."
     df = _filter_dates(df, start_date, end_date)
@@ -302,7 +370,7 @@ def get_heart_rate(
     stat: mean (default), min, max.
     Optionally filter by start_date and/or end_date (YYYY-MM-DD).
     """
-    df = _get_frame("heart_rate")
+    df = _get_frame("heart_rate", start_date, end_date)
     if df is None or df.empty:
         return "No heart rate data available."
     df = _filter_dates(df, start_date, end_date)
@@ -329,7 +397,7 @@ def get_resting_heart_rate(start_date: Optional[str] = None, end_date: Optional[
     """
     Returns resting heart rate values by day. Optionally filter by date range (YYYY-MM-DD).
     """
-    df = _get_frame("resting_hr")
+    df = _get_frame("resting_hr", start_date, end_date)
     if df is None or df.empty:
         return "No resting heart rate data available."
     df = _filter_dates(df, start_date, end_date)
@@ -347,8 +415,7 @@ def get_sleep(
     Columns: Core, Deep, REM, Asleep (pre-watchOS 9), Awake, InBed, Total_sleep_h.
     Optionally filter by start_date and/or end_date (YYYY-MM-DD).
     """
-    data = _load_data()
-    df = data["frames"].get("sleep")
+    df = _get_frame("sleep", start_date, end_date)
     if df is None or df.empty:
         return "No sleep data available."
 
@@ -444,10 +511,9 @@ def get_body_metrics(start_date: Optional[str] = None, end_date: Optional[str] =
     Returns body metrics: weight (kg), BMI, body fat %, and lean body mass over time.
     Optionally filter by date range (YYYY-MM-DD).
     """
-    data = _load_data()
     results = []
     for short in ["body_mass", "bmi", "body_fat", "lean_body_mass"]:
-        df = _get_frame(short)
+        df = _get_frame(short, start_date, end_date)
         if df is not None and not df.empty:
             df = _filter_dates(df, start_date, end_date)
             if not df.empty:
@@ -464,7 +530,6 @@ def get_activity_energy(start_date: Optional[str] = None, end_date: Optional[str
     Returns daily active and basal energy burned (kcal), plus walking/running distance.
     Optionally filter by date range (YYYY-MM-DD).
     """
-    data = _load_data()
     sections = []
     for short, label in [
         ("active_energy", "Active energy (kcal)"),
@@ -472,7 +537,7 @@ def get_activity_energy(start_date: Optional[str] = None, end_date: Optional[str
         ("distance_walk", "Walking/running distance"),
         ("flights_climbed", "Flights climbed"),
     ]:
-        df = _get_frame(short)
+        df = _get_frame(short, start_date, end_date)
         if df is not None and not df.empty:
             df = _filter_dates(df, start_date, end_date)
             if not df.empty:
@@ -493,7 +558,6 @@ def get_nutrition(start_date: Optional[str] = None, end_date: Optional[str] = No
     Returns daily nutritional intake: energy (kcal), protein, carbs, fat.
     Optionally filter by date range (YYYY-MM-DD).
     """
-    data = _load_data()
     sections = []
     for short, label in [
         ("dietary_energy",  "Energy (kcal)"),
@@ -501,7 +565,7 @@ def get_nutrition(start_date: Optional[str] = None, end_date: Optional[str] = No
         ("dietary_carbs",   "Carbohydrates (g)"),
         ("dietary_fat",     "Total fat (g)"),
     ]:
-        df = _get_frame(short)
+        df = _get_frame(short, start_date, end_date)
         if df is not None and not df.empty:
             df = _filter_dates(df, start_date, end_date)
             if not df.empty:
@@ -527,7 +591,7 @@ def query_health_data(
     aggregation: sum, mean, min, max (default: sum)
     start_date / end_date: YYYY-MM-DD (optional)
     """
-    df = _get_frame(metric)
+    df = _get_frame(metric, start_date, end_date)
     if df is None:
         available = ", ".join(SHORT_NAMES)
         return f"Unknown metric '{metric}'. Available: {available}"
