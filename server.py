@@ -385,30 +385,16 @@ def get_heart_rate(
     granularity: str = "daily",
 ) -> str:
     """
-    Returns heart rate aggregated by granularity: daily (default), weekly, monthly, or yearly.
-    stat: mean (default), min, max.
-    Optionally filter by start_date and/or end_date (YYYY-MM-DD).
+    DISABLED. Heart rate is the largest metric by far (1.69M rows, ~5x the
+    next biggest combined) and loading it risked exceeding the server's
+    memory limit. The underlying data is untouched on disk; see git history
+    for the previous implementation if this needs to come back.
     """
-    df = _get_frame("heart_rate", start_date, end_date)
-    if df is None or df.empty:
-        return "No heart rate data available."
-    df = _filter_dates(df, start_date, end_date)
-    agg_map = {"mean": "mean", "min": "min", "max": "max"}
-    agg = agg_map.get(stat, "mean")
-
-    daily = df.groupby("date")["value"].agg(agg).reset_index()
-    daily.columns = ["date", "bpm"]
-    daily["bpm"] = daily["bpm"].round(1)
-
-    if granularity == "daily":
-        overall = daily["bpm"].agg(agg)
-        return f"Heart rate ({stat}) overall: {overall:.1f} bpm\n\n{daily.to_string(index=False)}"
-
-    daily["period"] = daily["date"].apply(lambda d: _to_period(d, granularity))
-    grouped = daily.groupby("period")["bpm"].agg(agg).round(1).reset_index()
-    grouped.columns = ["period", f"bpm_{stat}"]
-    overall = grouped[f"bpm_{stat}"].agg(agg)
-    return f"Heart rate ({stat}) overall: {overall:.1f} bpm\n\n{grouped.to_string(index=False)}"
+    return (
+        "Heart rate queries are disabled on this server to keep memory "
+        "usage safe (heart_rate is ~1.69M rows, far larger than every "
+        "other metric combined). The data itself hasn't been deleted."
+    )
 
 
 @mcp.tool()
@@ -627,7 +613,9 @@ def query_health_data(
 # Health Auto Export metric names → our Parquet short names
 _HAE_METRIC_MAP = {
     "step_count":                        "steps",
-    "heart_rate":                        "heart_rate",
+    # "heart_rate" intentionally omitted — see config.py HK_TYPE_MAP for why.
+    # Unmapped HAE fields are skipped on ingest (see `if not short: continue`
+    # below), so this also stops new heart rate samples from being written.
     "resting_heart_rate":                "resting_hr",
     "active_energy":                     "active_energy",
     "basal_energy_burned":               "basal_energy",

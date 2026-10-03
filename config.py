@@ -5,7 +5,12 @@ Shared configuration for Apple Health MCP server and preprocessor.
 # HK type identifiers → short names used as Parquet filenames and tool metric keys
 HK_TYPE_MAP = {
     "HKQuantityTypeIdentifierStepCount":                      "steps",
-    "HKQuantityTypeIdentifierHeartRate":                      "heart_rate",
+    # HKQuantityTypeIdentifierHeartRate ("heart_rate") intentionally omitted:
+    # 1.69M rows, by far the largest metric (~5x the next biggest combined).
+    # Loading it risked exceeding the Fly.io VM's memory limit. Disabled at
+    # the query layer (see get_heart_rate() in server.py) and here, so the
+    # XML import no longer touches it either. heart_rate.parquet itself is
+    # left untouched on disk — re-add this line to bring it back.
     "HKQuantityTypeIdentifierRestingHeartRate":                "resting_hr",
     "HKQuantityTypeIdentifierActiveEnergyBurned":             "active_energy",
     "HKQuantityTypeIdentifierBasalEnergyBurned":              "basal_energy",
