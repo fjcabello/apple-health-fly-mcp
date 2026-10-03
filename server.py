@@ -11,6 +11,7 @@ from collections import defaultdict
 from typing import Optional
 
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pyarrow.compute as pc
 from mcp.server.fastmcp import FastMCP
@@ -126,23 +127,11 @@ def _load_metric_frame(
     df["startDate"] = pd.to_datetime(df["startDate"], utc=True, errors="coerce")
     df["endDate"]   = pd.to_datetime(df["endDate"],   utc=True, errors="coerce")
 
-    # `unit` and `sourceName` repeat a handful of distinct values across
-    # every row (e.g. heart_rate.parquet: 1 distinct unit, 4 distinct
-    # sourceName, over 1.69M rows) — category dtype stores each value once
-    # instead of a full Python string object per row. `date` gets the same
-    # treatment but needs to stay ordered, since _filter_dates compares it
-    # with >=/<=; plain (unordered) categoricals raise on that.
+    # `date` stays a plain string: an ordered categorical raises TypeError
+    # in _filter_dates when the bound isn't one of its categories.
     for col in ("unit", "sourceName"):
         if col in df.columns:
             df[col] = df[col].astype("category")
-    if "date" in df.columns:
-        df["date"] = df["date"].astype("category").cat.as_ordered()
-
-    # `value` is numeric for every metric except sleep (a category string
-    # like HKCategoryValueSleepAnalysisAsleepCore) — float32 halves that
-    # column's memory with no meaningful precision loss for steps/bpm/kg/etc.
-    if "value" in df.columns and pd.api.types.is_float_dtype(df["value"]):
-        df["value"] = df["value"].astype("float32")
 
     return df
 
@@ -277,13 +266,69 @@ def _filter_dates(df: pd.DataFrame, start: Optional[str], end: Optional[str]) ->
     return df
 
 
-def _date_summary(df: pd.DataFrame, agg: str = "sum") -> str:
-    if df.empty:
+_DAILY_STATS = ("sum", "mean", "min", "max", "count")
+
+
+def _daily_stats(
+    short: str,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> Optional[pd.DataFrame]:
+    """Per-day sum/count/min/max/mean of a numeric metric's `value`.
+
+    Aggregated with pyarrow in 100k-row batches over just the date/value
+    columns, so raw rows never become a pandas DataFrame: measured on
+    heart_rate (1.69M rows) this peaks at ~+40MB versus ~+300MB for the
+    full-frame pandas path, and pyarrow's allocator hands the memory back
+    afterwards. The result (one row per day) is cached for the whole
+    history; date ranges are sliced from it.
+    """
+    cache = _cache.setdefault("daily", {})
+    if short not in cache:
+        path = DATA_DIR / f"{short}.parquet"
+        if not path.exists():
+            return None
+        pf = pq.ParquetFile(path)
+        partials = [
+            pa.Table.from_batches([batch]).group_by("date").aggregate(
+                [("value", "sum"), ("value", "count"), ("value", "min"), ("value", "max")]
+            )
+            for batch in pf.iter_batches(batch_size=100_000, columns=["date", "value"])
+        ]
+        if partials:
+            daily = (
+                pa.concat_tables(partials)
+                .group_by("date")
+                .aggregate([("value_sum", "sum"), ("value_count", "sum"),
+                            ("value_min", "min"), ("value_max", "max")])
+                .to_pandas()
+            )
+            daily.columns = ["date", "sum", "count", "min", "max"]
+            daily["date"] = daily["date"].astype(str)
+            daily["sum"] = daily["sum"].fillna(0.0)
+            daily["mean"] = daily["sum"] / daily["count"].where(daily["count"] > 0)
+            daily = daily.sort_values("date", ignore_index=True)
+            first = next(pf.iter_batches(batch_size=1, columns=["unit"]), None)
+            daily.attrs["unit"] = first.column(0)[0].as_py() if first is not None and first.num_rows else ""
+        else:
+            daily = pd.DataFrame(columns=["date", "sum", "count", "min", "max", "mean"])
+            daily.attrs["unit"] = ""
+        cache[short] = daily
+
+    daily = cache[short]
+    if start:
+        daily = daily[daily["date"] >= start]
+    if end:
+        daily = daily[daily["date"] <= end]
+    return daily
+
+
+def _date_summary(daily: pd.DataFrame, agg: str = "sum") -> str:
+    if daily.empty:
         return "No data for the specified range."
-    daily = df.groupby("date")["value"].agg(agg).reset_index()
-    daily.columns = ["date", "value"]
-    daily["value"] = daily["value"].round(2)
-    return daily.to_string(index=False)
+    out = daily[["date", agg]].rename(columns={agg: "value"})
+    out["value"] = out["value"].round(2)
+    return out.to_string(index=False)
 
 
 def _to_period(date_str: str, granularity: str) -> str:
@@ -355,13 +400,11 @@ def get_steps(
     Returns step counts aggregated by granularity: daily (default), weekly, monthly, or yearly.
     Optionally filter by start_date and/or end_date (YYYY-MM-DD).
     """
-    df = _get_frame("steps", start_date, end_date)
-    if df is None or df.empty:
+    stats = _daily_stats("steps", start_date, end_date)
+    if stats is None or stats.empty:
         return "No step data available."
-    df = _filter_dates(df, start_date, end_date)
 
-    daily = df.groupby("date")["value"].sum().reset_index()
-    daily.columns = ["date", "steps"]
+    daily = stats[["date", "sum"]].rename(columns={"sum": "steps"})
 
     if granularity == "daily":
         total = int(daily["steps"].sum())
@@ -389,15 +432,12 @@ def get_heart_rate(
     stat: mean (default), min, max.
     Optionally filter by start_date and/or end_date (YYYY-MM-DD).
     """
-    df = _get_frame("heart_rate", start_date, end_date)
-    if df is None or df.empty:
+    stats = _daily_stats("heart_rate", start_date, end_date)
+    if stats is None or stats.empty:
         return "No heart rate data available."
-    df = _filter_dates(df, start_date, end_date)
-    agg_map = {"mean": "mean", "min": "min", "max": "max"}
-    agg = agg_map.get(stat, "mean")
+    agg = stat if stat in ("mean", "min", "max") else "mean"
 
-    daily = df.groupby("date")["value"].agg(agg).reset_index()
-    daily.columns = ["date", "bpm"]
+    daily = stats[["date", agg]].rename(columns={agg: "bpm"})
     daily["bpm"] = daily["bpm"].round(1)
 
     if granularity == "daily":
@@ -416,11 +456,10 @@ def get_resting_heart_rate(start_date: Optional[str] = None, end_date: Optional[
     """
     Returns resting heart rate values by day. Optionally filter by date range (YYYY-MM-DD).
     """
-    df = _get_frame("resting_hr", start_date, end_date)
-    if df is None or df.empty:
+    stats = _daily_stats("resting_hr", start_date, end_date)
+    if stats is None or stats.empty:
         return "No resting heart rate data available."
-    df = _filter_dates(df, start_date, end_date)
-    return _date_summary(df, "mean")
+    return _date_summary(stats, "mean")
 
 
 @mcp.tool()
@@ -532,13 +571,10 @@ def get_body_metrics(start_date: Optional[str] = None, end_date: Optional[str] =
     """
     results = []
     for short in ["body_mass", "bmi", "body_fat", "lean_body_mass"]:
-        df = _get_frame(short, start_date, end_date)
-        if df is not None and not df.empty:
-            df = _filter_dates(df, start_date, end_date)
-            if not df.empty:
-                unit = df["unit"].iloc[0] if "unit" in df.columns else ""
-                daily = df.groupby("date")["value"].mean().round(2).reset_index()
-                results.append(f"--- {short} ({unit}) ---\n{daily.to_string(index=False)}")
+        stats = _daily_stats(short, start_date, end_date)
+        if stats is not None and not stats.empty:
+            unit = stats.attrs.get("unit", "")
+            results.append(f"--- {short} ({unit}) ---\n{_date_summary(stats, 'mean')}")
 
     return "\n\n".join(results) if results else "No body metrics available."
 
@@ -556,18 +592,16 @@ def get_activity_energy(start_date: Optional[str] = None, end_date: Optional[str
         ("distance_walk", "Walking/running distance"),
         ("flights_climbed", "Flights climbed"),
     ]:
-        df = _get_frame(short, start_date, end_date)
-        if df is not None and not df.empty:
-            df = _filter_dates(df, start_date, end_date)
-            if not df.empty:
-                unit = df["unit"].iloc[0] if "unit" in df.columns else ""
-                total = df["value"].sum()
-                avg   = df.groupby("date")["value"].sum().mean()
-                sections.append(
-                    f"--- {label} ({unit}) ---\n"
-                    f"Total: {total:,.1f}  |  Daily average: {avg:,.1f}\n"
-                    f"{_date_summary(df, 'sum')}"
-                )
+        stats = _daily_stats(short, start_date, end_date)
+        if stats is not None and not stats.empty:
+            unit = stats.attrs.get("unit", "")
+            total = stats["sum"].sum()
+            avg   = stats["sum"].mean()
+            sections.append(
+                f"--- {label} ({unit}) ---\n"
+                f"Total: {total:,.1f}  |  Daily average: {avg:,.1f}\n"
+                f"{_date_summary(stats, 'sum')}"
+            )
     return "\n\n".join(sections) if sections else "No energy/activity data available."
 
 
@@ -584,11 +618,9 @@ def get_nutrition(start_date: Optional[str] = None, end_date: Optional[str] = No
         ("dietary_carbs",   "Carbohydrates (g)"),
         ("dietary_fat",     "Total fat (g)"),
     ]:
-        df = _get_frame(short, start_date, end_date)
-        if df is not None and not df.empty:
-            df = _filter_dates(df, start_date, end_date)
-            if not df.empty:
-                sections.append(f"--- {label} ---\n{_date_summary(df, 'sum')}")
+        stats = _daily_stats(short, start_date, end_date)
+        if stats is not None and not stats.empty:
+            sections.append(f"--- {label} ---\n{_date_summary(stats, 'sum')}")
     return "\n\n".join(sections) if sections else "No nutrition data available."
 
 
@@ -610,14 +642,24 @@ def query_health_data(
     aggregation: sum, mean, min, max (default: sum)
     start_date / end_date: YYYY-MM-DD (optional)
     """
-    df = _get_frame(metric, start_date, end_date)
-    if df is None:
+    if metric == "sleep":
+        df = _get_frame(metric, start_date, end_date)
+        if df is None or df.empty:
+            return f"No data for '{metric}'."
+        df = _filter_dates(df, start_date, end_date)
+        daily = df.groupby("date")["value"].agg(aggregation).reset_index()
+        daily.columns = ["date", "value"]
+        return daily.to_string(index=False)
+
+    if aggregation not in _DAILY_STATS:
+        return f"Unsupported aggregation '{aggregation}'. Use one of: {', '.join(_DAILY_STATS)}"
+    stats = _daily_stats(metric, start_date, end_date)
+    if stats is None:
         available = ", ".join(SHORT_NAMES)
         return f"Unknown metric '{metric}'. Available: {available}"
-    if df.empty:
+    if stats.empty:
         return f"No data for '{metric}'."
-    df = _filter_dates(df, start_date, end_date)
-    return _date_summary(df, aggregation)
+    return _date_summary(stats, aggregation)
 
 
 # ---------------------------------------------------------------------------
