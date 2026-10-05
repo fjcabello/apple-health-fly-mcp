@@ -864,25 +864,31 @@ async def ingest_handler(request):
     if not _check_ingest_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
+    body = await request.body()
     try:
-        payload = await request.json()
+        payload = json.loads(body)
     except Exception:
         return JSONResponse({"error": "invalid JSON"}, status_code=400)
 
-    # Save raw payload for debugging (overwritten each call)
+    # Save raw payload for debugging (overwritten each call). The bytes as
+    # received: re-dumping with indent doubled the size and the memory.
     DATA_DIR.mkdir(exist_ok=True)
-    _LAST_PAYLOAD_PATH.write_text(json.dumps(payload, indent=2, default=str))
+    _LAST_PAYLOAD_PATH.write_bytes(body)
+    del body
 
     updated: dict[str, int] = {}
     data_root = payload.get("data", payload)
 
     metrics = data_root.get("metrics", [])
     for metric in metrics:
+        # pop: each metric's samples are freed once processed instead of the
+        # whole parsed payload staying alive until the request ends.
+        data = metric.pop("data", None) or []
         hae_name = metric.get("name", "")
 
         if hae_name == "sleep_analysis":
             sleep_rows = []
-            for sample in metric.get("data", []):
+            for sample in data:
                 date_str = sample.get("date")
                 # Keep the original local offset (not utc=True) so the calendar date
                 # matches HAE's own "date" field — converting midnight-local straight
@@ -920,8 +926,8 @@ async def ingest_handler(request):
             continue
 
         unit = metric.get("units", "")
-        rows = []
-        for sample in metric.get("data", []):
+        samples = []
+        for sample in data:
             date_str = sample.get("date") or sample.get("startDate")
             if not date_str:
                 continue
@@ -930,17 +936,19 @@ async def ingest_handler(request):
             value = next((sample[k] for k in ("qty", "Avg", "value") if sample.get(k) is not None), None)
             if value is None:
                 continue
-            start = pd.to_datetime(date_str, utc=True, errors="coerce")
-            if pd.isna(start):
-                continue
-            end_str = sample.get("endDate", date_str)
-            rows.append({
-                "startDate":  start.isoformat(),
-                "endDate":    pd.to_datetime(end_str, utc=True, errors="coerce").isoformat(),
-                "value":      float(value),
-                "unit":       unit,
-                "sourceName": sample.get("source", "HealthAutoExport"),
-            })
+            samples.append((date_str, sample.get("endDate", date_str), float(value),
+                            sample.get("source", "HealthAutoExport")))
+
+        # Dates are parsed per metric in one call: per-sample pd.to_datetime
+        # re-guessed the format every time (~1.3ms each, minutes per backfill).
+        starts = pd.to_datetime([s[0] for s in samples], utc=True, errors="coerce")
+        ends   = pd.to_datetime([s[1] for s in samples], utc=True, errors="coerce")
+        rows = [
+            {"startDate": start.isoformat(), "endDate": end.isoformat(),
+             "value": value, "unit": unit, "sourceName": source}
+            for (_, _, value, source), start, end in zip(samples, starts, ends)
+            if not pd.isna(start)
+        ]
 
         added = _upsert_parquet(short, rows)
         if rows:
