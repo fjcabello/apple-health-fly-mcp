@@ -690,6 +690,11 @@ _HAE_METRIC_MAP = {
     "dietary_protein":                   "dietary_protein",
     "dietary_carbohydrates":             "dietary_carbs",
     "dietary_fat_total":                 "dietary_fat",
+    # Names Health Auto Export 10.x actually sends for the same metrics
+    "dietary_energy":                    "dietary_energy",
+    "protein":                           "dietary_protein",
+    "carbohydrates":                     "dietary_carbs",
+    "total_fat":                         "dietary_fat",
     "headphone_audio_exposure":          "headphone_audio",
 }
 
@@ -920,8 +925,9 @@ async def ingest_handler(request):
             date_str = sample.get("date") or sample.get("startDate")
             if not date_str:
                 continue
-            # HAE sends qty for most metrics; heart_rate sends Avg/Min/Max
-            value = sample.get("qty") or sample.get("Avg") or sample.get("value")
+            # HAE sends qty for most metrics; heart_rate sends Avg/Min/Max.
+            # `is not None`, not `or`: a real 0 (e.g. a day with no food logged) must be kept.
+            value = next((sample[k] for k in ("qty", "Avg", "value") if sample.get(k) is not None), None)
             if value is None:
                 continue
             start = pd.to_datetime(date_str, utc=True, errors="coerce")
