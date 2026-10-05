@@ -826,6 +826,13 @@ def _upsert_sleep(new_rows: list[dict]) -> int:
     return len(new_df)
 
 
+def _hae_source(value) -> str:
+    """HAE 10.x sends a workout's source as {"name": ..., "identifier": ...}."""
+    if isinstance(value, dict):
+        return value.get("name") or "HealthAutoExport"
+    return value or "HealthAutoExport"
+
+
 def _upsert_workouts(new_rows: list[dict]) -> int:
     """Merge new workout rows into workouts.parquet, dedup by startDate."""
     if not new_rows:
@@ -842,8 +849,10 @@ def _upsert_workouts(new_rows: list[dict]) -> int:
     new_df["date"]             = new_df["startDate"].dt.date.astype(str)
 
     path = DATA_DIR / "workouts.parquet"
+    existing_rows = 0
     if path.exists():
         existing = pd.read_parquet(path)
+        existing_rows = len(existing)
         existing["startDate"] = pd.to_datetime(existing["startDate"], utc=True, errors="coerce")
         combined = pd.concat([existing, new_df], ignore_index=True)
         combined = combined.drop_duplicates(subset=["startDate", "activityType"], keep="last")
@@ -853,8 +862,7 @@ def _upsert_workouts(new_rows: list[dict]) -> int:
     combined = combined.sort_values("startDate")
     combined.to_parquet(path, index=False)
 
-    added = len(combined) - (len(existing) if path.exists() else 0)
-    return max(added, 0)
+    return max(len(combined) - existing_rows, 0)
 
 
 async def ingest_handler(request):
@@ -984,7 +992,7 @@ async def ingest_handler(request):
             "totalEnergy_kcal":  _hae_qty(energy),
             "avgHeartRate":      (sum(avg_values) / len(avg_values)) if avg_values else None,
             "maxHeartRate":      max(max_values) if max_values else None,
-            "sourceName":        w.get("source", "HealthAutoExport"),
+            "sourceName":        _hae_source(w.get("source")),
         })
 
     added_workouts = _upsert_workouts(workout_rows)
