@@ -717,8 +717,18 @@ def _check_ingest_auth(request) -> bool:
     return hmac.compare_digest(api_key.encode(), _INGEST_SECRET.encode())
 
 
+_UPSERT_BATCH_ROWS = 65_536
+
+
 def _upsert_parquet(short: str, new_rows: list[dict]) -> int:
-    """Merge new_rows into the existing Parquet for `short`, dedup by startDate. Returns rows added."""
+    """Merge new_rows into the Parquet for `short`; a new row replaces any
+    existing row with the same startDate. Returns rows added.
+
+    The existing file is streamed in batches into a temp file that then
+    replaces it, so memory scales with the batch size, not the file: loading
+    heart_rate (1.69M rows) whole into pandas peaked at ~+300MB. Both inputs
+    are sorted by startDate, so interleaving per batch keeps the output sorted.
+    """
     if not new_rows:
         return 0
 
@@ -727,21 +737,48 @@ def _upsert_parquet(short: str, new_rows: list[dict]) -> int:
     new_df["endDate"]   = pd.to_datetime(new_df["endDate"],   utc=True, errors="coerce")
     new_df["value"]     = pd.to_numeric(new_df["value"], errors="coerce")
     new_df["date"]      = new_df["startDate"].dt.date.astype(str)
+    new_df = (new_df.drop_duplicates(subset=["startDate"], keep="last")
+                    .sort_values("startDate", ignore_index=True))
 
     path = DATA_DIR / f"{short}.parquet"
-    if path.exists():
-        existing = pd.read_parquet(path)
-        existing["startDate"] = pd.to_datetime(existing["startDate"], utc=True, errors="coerce")
-        combined = pd.concat([existing, new_df], ignore_index=True)
-        combined = combined.drop_duplicates(subset=["startDate"], keep="last")
-    else:
-        combined = new_df
+    if not path.exists():
+        new_df.to_parquet(path, index=False, row_group_size=_UPSERT_BATCH_ROWS)
+        return len(new_df)
 
-    combined = combined.sort_values("startDate")
-    combined.to_parquet(path, index=False)
+    # pre_buffer=False: don't read ahead whole row groups (~30MB on heart_rate).
+    pf = pq.ParquetFile(path, pre_buffer=False)
+    schema = pf.schema_arrow
+    new_tbl = pa.Table.from_pandas(new_df, preserve_index=False)
+    new_tbl = pa.table(
+        [new_tbl.column(f.name).cast(f.type, safe=False) if f.name in new_tbl.column_names
+         else pa.nulls(new_tbl.num_rows, f.type) for f in schema],
+        schema=schema,
+    )
+    new_starts = new_tbl.column("startDate")
 
-    added = len(combined) - (len(existing) if path.exists() else 0)
-    return max(added, 0)
+    tmp = path.with_name(path.name + ".tmp")
+    written = 0
+    taken = 0
+    with pq.ParquetWriter(tmp, schema) as writer:
+        for batch in pf.iter_batches(batch_size=_UPSERT_BATCH_ROWS):
+            starts = batch.column("startDate")
+            kept = pa.Table.from_batches([batch]).filter(
+                pc.invert(pc.is_in(starts, value_set=new_starts))
+            )
+            batch_max = pc.max(starts)
+            if batch_max.is_valid:
+                upto = pc.sum(pc.less_equal(new_starts, batch_max)).as_py() or 0
+                chunk = new_tbl.slice(taken, max(upto - taken, 0))
+                taken = max(upto, taken)
+                kept = pa.concat_tables([kept, chunk]).sort_by("startDate")
+            writer.write_table(kept)
+            written += kept.num_rows
+        rest = new_tbl.slice(taken)
+        writer.write_table(rest)
+        written += rest.num_rows
+    os.replace(tmp, path)
+
+    return max(written - pf.metadata.num_rows, 0)
 
 
 def _hae_qty(value) -> Optional[float]:
