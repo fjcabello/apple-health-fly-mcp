@@ -27,7 +27,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 
-from server import _cache, ingest_app, mcp
+from server import _cache, ingest_app, mcp, migrate_energy_units
 
 API_KEY = os.environ.get("API_KEY")
 if not API_KEY:
@@ -125,6 +125,8 @@ app = RootApp(mcp_app, admin_app, ingest_app)
 
 if __name__ == "__main__":
     import uvicorn
+
+    print(f"[apple-health-mcp] energy kJ->kcal migration: {migrate_energy_units() or 'nothing to convert'}", file=sys.stderr)
     from uvicorn.config import LOGGING_CONFIG
 
     log_config = copy.deepcopy(LOGGING_CONFIG)
