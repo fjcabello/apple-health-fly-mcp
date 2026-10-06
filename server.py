@@ -723,6 +723,39 @@ def _check_ingest_auth(request) -> bool:
 
 
 _UPSERT_BATCH_ROWS = 65_536
+KJ_PER_KCAL = 4.184
+_ENERGY_METRICS = ("active_energy", "basal_energy", "dietary_energy")
+
+
+def migrate_energy_units() -> dict[str, int]:
+    """Convert stored kJ energy rows to kcal, in place. Returns rows converted
+    per metric. Idempotent: files with no kJ rows are only read (unit column),
+    never rewritten. Rows from before the ingest-time conversion were stored
+    in kJ while every tool reports kcal."""
+    converted = {}
+    for short in _ENERGY_METRICS:
+        path = DATA_DIR / f"{short}.parquet"
+        if not path.exists():
+            continue
+        n_kj = pc.sum(pc.equal(pq.read_table(path, columns=["unit"]).column("unit"), "kJ")).as_py() or 0
+        if not n_kj:
+            continue
+        pf = pq.ParquetFile(path, pre_buffer=False)
+        schema = pf.schema_arrow
+        tmp = path.with_name(path.name + ".tmp")
+        with pq.ParquetWriter(tmp, schema) as writer:
+            for batch in pf.iter_batches(batch_size=_UPSERT_BATCH_ROWS):
+                tbl = pa.Table.from_batches([batch])
+                is_kj = pc.fill_null(pc.equal(tbl.column("unit"), "kJ"), False)
+                value = pc.if_else(is_kj, pc.divide(tbl.column("value"), KJ_PER_KCAL), tbl.column("value"))
+                unit = pc.if_else(is_kj, pa.scalar("kcal", schema.field("unit").type), tbl.column("unit"))
+                tbl = tbl.set_column(schema.get_field_index("value"), schema.field("value"), value)
+                tbl = tbl.set_column(schema.get_field_index("unit"), schema.field("unit"), unit)
+                writer.write_table(tbl)
+        os.replace(tmp, path)
+        converted[short] = n_kj
+    _cache.clear()
+    return converted
 
 
 def _upsert_parquet(short: str, new_rows: list[dict]) -> int:
@@ -934,6 +967,11 @@ async def ingest_handler(request):
             continue
 
         unit = metric.get("units", "")
+        # HAE sends energy in the phone's preferred unit (kJ here); everything
+        # stored and reported is kcal, so convert at the door.
+        factor = 1.0
+        if unit == "kJ":
+            unit, factor = "kcal", 1 / KJ_PER_KCAL
         samples = []
         for sample in data:
             date_str = sample.get("date") or sample.get("startDate")
@@ -944,7 +982,7 @@ async def ingest_handler(request):
             value = next((sample[k] for k in ("qty", "Avg", "value") if sample.get(k) is not None), None)
             if value is None:
                 continue
-            samples.append((date_str, sample.get("endDate", date_str), float(value),
+            samples.append((date_str, sample.get("endDate", date_str), float(value) * factor,
                             sample.get("source", "HealthAutoExport")))
 
         # Dates are parsed per metric in one call: per-sample pd.to_datetime
