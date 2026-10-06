@@ -759,8 +759,15 @@ def migrate_energy_units() -> dict[str, int]:
 
 
 def _upsert_parquet(short: str, new_rows: list[dict]) -> int:
-    """Merge new_rows into the Parquet for `short`; a new row replaces any
-    existing row with the same startDate. Returns rows added.
+    """Merge new_rows into the Parquet for `short`. Existing rows whose
+    startDate falls inside the new rows' [first, last] window are replaced,
+    whatever their source. Returns rows added (net).
+
+    Matching on exact startDate let the same period pile up: HAE aligns its
+    per-minute buckets to each export's start time and labels sources
+    differently between automatic and manual exports, so overlapping syncs
+    produced full second copies (e.g. two complete sets of steps for a day).
+    The latest export of a window now wins.
 
     The existing file is streamed in batches into a temp file that then
     replaces it, so memory scales with the batch size, not the file: loading
@@ -793,6 +800,7 @@ def _upsert_parquet(short: str, new_rows: list[dict]) -> int:
         schema=schema,
     )
     new_starts = new_tbl.column("startDate")
+    window_lo, window_hi = pc.min(new_starts), pc.max(new_starts)
 
     tmp = path.with_name(path.name + ".tmp")
     written = 0
@@ -800,9 +808,8 @@ def _upsert_parquet(short: str, new_rows: list[dict]) -> int:
     with pq.ParquetWriter(tmp, schema) as writer:
         for batch in pf.iter_batches(batch_size=_UPSERT_BATCH_ROWS):
             starts = batch.column("startDate")
-            kept = pa.Table.from_batches([batch]).filter(
-                pc.invert(pc.is_in(starts, value_set=new_starts))
-            )
+            in_window = pc.and_(pc.greater_equal(starts, window_lo), pc.less_equal(starts, window_hi))
+            kept = pa.Table.from_batches([batch]).filter(pc.invert(pc.fill_null(in_window, False)))
             batch_max = pc.max(starts)
             if batch_max.is_valid:
                 upto = pc.sum(pc.less_equal(new_starts, batch_max)).as_py() or 0
