@@ -17,7 +17,7 @@ import pyarrow.parquet as pq
 import pyarrow.compute as pc
 from mcp.server.fastmcp import FastMCP
 
-from config import HK_TYPE_MAP, SHORT_NAMES, SLEEP_VALUES, CATEGORY_TYPES
+from config import HK_TYPE_MAP, SHORT_NAMES, SLEEP_VALUES, CATEGORY_TYPES, PERCENT_METRICS
 
 # ---------------------------------------------------------------------------
 # Config
@@ -213,6 +213,8 @@ def _load_from_xml() -> None:
         df["endDate"]   = pd.to_datetime(df["endDate"],   utc=True, errors="coerce")
         if hk_type not in CATEGORY_TYPES:
             df["value"] = pd.to_numeric(df["value"], errors="coerce")
+        if short in PERCENT_METRICS:
+            df["value"] = df["value"] * 100
         df["date"]      = df["startDate"].dt.date.astype(str)
         frames[short] = df
 
@@ -727,6 +729,22 @@ KJ_PER_KCAL = 4.184
 _ENERGY_METRICS = ("active_energy", "basal_energy", "dietary_energy")
 
 
+def _rewrite_parquet(path: Path, transform) -> None:
+    """Stream `path` through transform(table) -> table in batches into a temp
+    file, then replace it. Schema is preserved."""
+    pf = pq.ParquetFile(path, pre_buffer=False)
+    tmp = path.with_name(path.name + ".tmp")
+    with pq.ParquetWriter(tmp, pf.schema_arrow) as writer:
+        for batch in pf.iter_batches(batch_size=_UPSERT_BATCH_ROWS):
+            writer.write_table(transform(pa.Table.from_batches([batch])))
+    os.replace(tmp, path)
+
+
+def _set_column(tbl: pa.Table, name: str, values) -> pa.Table:
+    i = tbl.schema.get_field_index(name)
+    return tbl.set_column(i, tbl.schema.field(i), values)
+
+
 def migrate_energy_units() -> dict[str, int]:
     """Convert stored kJ energy rows to kcal, in place. Returns rows converted
     per metric. Idempotent: files with no kJ rows are only read (unit column),
@@ -740,20 +758,49 @@ def migrate_energy_units() -> dict[str, int]:
         n_kj = pc.sum(pc.equal(pq.read_table(path, columns=["unit"]).column("unit"), "kJ")).as_py() or 0
         if not n_kj:
             continue
-        pf = pq.ParquetFile(path, pre_buffer=False)
-        schema = pf.schema_arrow
-        tmp = path.with_name(path.name + ".tmp")
-        with pq.ParquetWriter(tmp, schema) as writer:
-            for batch in pf.iter_batches(batch_size=_UPSERT_BATCH_ROWS):
-                tbl = pa.Table.from_batches([batch])
-                is_kj = pc.fill_null(pc.equal(tbl.column("unit"), "kJ"), False)
-                value = pc.if_else(is_kj, pc.divide(tbl.column("value"), KJ_PER_KCAL), tbl.column("value"))
-                unit = pc.if_else(is_kj, pa.scalar("kcal", schema.field("unit").type), tbl.column("unit"))
-                tbl = tbl.set_column(schema.get_field_index("value"), schema.field("value"), value)
-                tbl = tbl.set_column(schema.get_field_index("unit"), schema.field("unit"), unit)
-                writer.write_table(tbl)
-        os.replace(tmp, path)
+
+        def to_kcal(tbl: pa.Table) -> pa.Table:
+            is_kj = pc.fill_null(pc.equal(tbl.column("unit"), "kJ"), False)
+            tbl = _set_column(tbl, "value", pc.if_else(is_kj, pc.divide(tbl.column("value"), KJ_PER_KCAL), tbl.column("value")))
+            return _set_column(tbl, "unit", pc.if_else(is_kj, pa.scalar("kcal", tbl.schema.field("unit").type), tbl.column("unit")))
+
+        _rewrite_parquet(path, to_kcal)
         converted[short] = n_kj
+    _cache.clear()
+    return converted
+
+
+_MIGRATIONS_PATH = DATA_DIR / ".migrations.json"
+# Everything stored before this date came from the XML export (fractions);
+# Health Auto Export data (percentages) starts 2026-08-06, and from 08-01 on
+# the data is being re-sent through HAE, which replaces those windows.
+_XML_ONLY_BEFORE = "2026-08-01"
+
+
+def migrate_percent_scale() -> dict[str, int]:
+    """One-off: scale XML-era fraction rows of PERCENT_METRICS to percentages.
+    Value thresholds can't tell them apart (a 0.5% walking asymmetry is a
+    real HAE value), so it runs by date and is recorded in .migrations.json
+    so it never runs twice."""
+    import json
+
+    done = set(json.loads(_MIGRATIONS_PATH.read_text())) if _MIGRATIONS_PATH.exists() else set()
+    if "percent_scale_v1" in done:
+        return {}
+    converted = {}
+    for short in sorted(PERCENT_METRICS):
+        path = DATA_DIR / f"{short}.parquet"
+        if not path.exists():
+            continue
+        n = pc.sum(pc.less(pq.read_table(path, columns=["date"]).column("date"), _XML_ONLY_BEFORE)).as_py() or 0
+        if n:
+            def to_percent(tbl: pa.Table) -> pa.Table:
+                xml_era = pc.fill_null(pc.less(tbl.column("date"), _XML_ONLY_BEFORE), False)
+                return _set_column(tbl, "value", pc.if_else(xml_era, pc.multiply(tbl.column("value"), 100.0), tbl.column("value")))
+
+            _rewrite_parquet(path, to_percent)
+        converted[short] = n
+    _MIGRATIONS_PATH.write_text(json.dumps(sorted(done | {"percent_scale_v1"})))
     _cache.clear()
     return converted
 
