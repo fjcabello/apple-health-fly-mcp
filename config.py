@@ -32,6 +32,10 @@ HK_TYPE_MAP = {
 # Short names used by the MCP server to load Parquet files
 SHORT_NAMES = sorted(set(HK_TYPE_MAP.values()))
 
+# Metrics HealthKit's XML export stores as fractions (0.35) while Health
+# Auto Export sends percentages (35). Stored and reported as percentages.
+PERCENT_METRICS = {"body_fat", "walking_double_support", "walking_asymmetry", "walking_steadiness"}
+
 # HK types whose value is a category string (not numeric)
 CATEGORY_TYPES = {
     "HKCategoryTypeIdentifierSleepAnalysis",

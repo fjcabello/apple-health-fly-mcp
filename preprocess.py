@@ -16,7 +16,7 @@ from pathlib import Path
 from lxml import etree
 import pandas as pd
 
-from config import HK_TYPE_MAP, CATEGORY_TYPES
+from config import HK_TYPE_MAP, CATEGORY_TYPES, PERCENT_METRICS
 
 # ---------------------------------------------------------------------------
 # Config
@@ -90,6 +90,8 @@ def parse_and_save(export_path: Path, output_dir: Path) -> None:
         if hk_type not in CATEGORY_TYPES:
             df["value"] = pd.to_numeric(df["value"], errors="coerce")
         # else: keep value as string (e.g. sleep stage names)
+        if short in PERCENT_METRICS:
+            df["value"] = df["value"] * 100
 
         # --- Sleep-specific cleanup -------------------------------------------
         if short == "sleep":
