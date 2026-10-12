@@ -27,7 +27,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 
-from server import _cache, ingest_app, mcp, migrate_energy_units, migrate_percent_scale
+from server import _cache, ingest_app, mcp, migrate_energy_units, migrate_percent_scale, migrate_workout_energy
 
 API_KEY = os.environ.get("API_KEY")
 if not API_KEY:
@@ -128,6 +128,7 @@ if __name__ == "__main__":
 
     print(f"[apple-health-mcp] energy kJ->kcal migration: {migrate_energy_units() or 'nothing to convert'}", file=sys.stderr)
     print(f"[apple-health-mcp] percent scale migration: {migrate_percent_scale() or 'already done'}", file=sys.stderr)
+    print(f"[apple-health-mcp] workout energy kJ->kcal migration: {migrate_workout_energy()} workouts converted", file=sys.stderr)
     from uvicorn.config import LOGGING_CONFIG
 
     log_config = copy.deepcopy(LOGGING_CONFIG)

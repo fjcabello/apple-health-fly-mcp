@@ -782,10 +782,7 @@ def migrate_percent_scale() -> dict[str, int]:
     Value thresholds can't tell them apart (a 0.5% walking asymmetry is a
     real HAE value), so it runs by date and is recorded in .migrations.json
     so it never runs twice."""
-    import json
-
-    done = set(json.loads(_MIGRATIONS_PATH.read_text())) if _MIGRATIONS_PATH.exists() else set()
-    if "percent_scale_v1" in done:
+    if "percent_scale_v1" in _migrations_done():
         return {}
     converted = {}
     for short in sorted(PERCENT_METRICS):
@@ -800,9 +797,46 @@ def migrate_percent_scale() -> dict[str, int]:
 
             _rewrite_parquet(path, to_percent)
         converted[short] = n
-    _MIGRATIONS_PATH.write_text(json.dumps(sorted(done | {"percent_scale_v1"})))
+    _mark_migration("percent_scale_v1")
     _cache.clear()
     return converted
+
+
+def _migrations_done() -> set[str]:
+    import json
+    return set(json.loads(_MIGRATIONS_PATH.read_text())) if _MIGRATIONS_PATH.exists() else set()
+
+
+def _mark_migration(name: str) -> None:
+    import json
+    _MIGRATIONS_PATH.write_text(json.dumps(sorted(_migrations_done() | {name})))
+
+
+# First day Health Auto Export workouts were stored (their energy came in kJ);
+# XML-export workouts before it carry kcal or no energy at all.
+_HAE_WORKOUTS_FROM = "2026-08-06"
+
+
+def migrate_workout_energy() -> int:
+    """One-off: convert stored HAE workout energy from kJ to kcal. Returns
+    workouts converted. Recorded in .migrations.json so it never runs twice;
+    workouts ingested after this are converted at the door."""
+    if "workout_energy_kj_v1" in _migrations_done():
+        return 0
+    path = DATA_DIR / "workouts.parquet"
+    n = 0
+    if path.exists():
+        df = pd.read_parquet(path)
+        hae = (df["date"] >= _HAE_WORKOUTS_FROM) & df["totalEnergy_kcal"].notna()
+        n = int(hae.sum())
+        if n:
+            df.loc[hae, "totalEnergy_kcal"] = df.loc[hae, "totalEnergy_kcal"] / KJ_PER_KCAL
+            tmp = path.with_name(path.name + ".tmp")
+            df.to_parquet(tmp, index=False)
+            os.replace(tmp, path)
+    _mark_migration("workout_energy_kj_v1")
+    _cache.clear()
+    return n
 
 
 def _upsert_parquet(short: str, new_rows: list[dict]) -> int:
@@ -911,6 +945,14 @@ def _upsert_sleep(new_rows: list[dict]) -> int:
     combined = combined.sort_values("startDate")
     combined.to_parquet(path, index=False)
     return len(new_df)
+
+
+def _hae_energy_kcal(value) -> Optional[float]:
+    """HAE workout energy is {"qty", "units"}, in kJ when that's the phone's unit."""
+    qty = _hae_qty(value)
+    if qty is not None and isinstance(value, dict) and value.get("units") == "kJ":
+        return qty / KJ_PER_KCAL
+    return qty
 
 
 def _hae_source(value) -> str:
@@ -1068,7 +1110,7 @@ async def ingest_handler(request):
 
         duration_sec = _hae_qty(w.get("duration"))
         distance     = w.get("distance") or w.get("totalDistance")
-        energy       = w.get("activeEnergyBurned") or w.get("totalEnergyBurned")
+        energy       = w.get("activeEnergyBurned") or w.get("totalEnergy") or w.get("totalEnergyBurned")
 
         hr_samples = w.get("heartRateData", [])
         avg_values = [_hae_qty(s.get("Avg")) for s in hr_samples if _hae_qty(s.get("Avg")) is not None]
@@ -1081,7 +1123,7 @@ async def ingest_handler(request):
             "duration_min":      (duration_sec / 60) if duration_sec is not None else None,
             "totalDistance":     _hae_qty(distance),
             "totalDistanceUnit": distance.get("units", "") if isinstance(distance, dict) else "",
-            "totalEnergy_kcal":  _hae_qty(energy),
+            "totalEnergy_kcal":  _hae_energy_kcal(energy),
             "avgHeartRate":      (sum(avg_values) / len(avg_values)) if avg_values else None,
             "maxHeartRate":      max(max_values) if max_values else None,
             "sourceName":        _hae_source(w.get("source")),
