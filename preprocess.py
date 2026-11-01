@@ -134,16 +134,19 @@ def parse_and_save(export_path: Path, output_dir: Path) -> None:
                 merged.append(r)
                 return pd.DataFrame(merged)
 
-            zepp["_night"] = zepp.apply(
-                lambda r: (pd.Timestamp(r["startDate"]).date() - pd.Timedelta(days=1)).isoformat()
-                if pd.Timestamp(r["startDate"]).hour < 12 else pd.Timestamp(r["startDate"]).date().isoformat(),
-                axis=1,
-            )
-            merged_parts = []
-            for (night, val), grp in zepp.groupby(["_night", "value"]):
-                merged_parts.append(_merge_intervals(grp))
-            zepp_merged = pd.concat(merged_parts, ignore_index=True).drop(columns=["_night"], errors="ignore")
-            df = pd.concat([other, zepp_merged], ignore_index=True)
+            # Exports with no Zepp Life sleep (Apple Watch / iPhone only) skip the
+            # merge: pd.concat([]) raises "No objects to concatenate" (issue #16).
+            if not zepp.empty:
+                zepp["_night"] = zepp.apply(
+                    lambda r: (pd.Timestamp(r["startDate"]).date() - pd.Timedelta(days=1)).isoformat()
+                    if pd.Timestamp(r["startDate"]).hour < 12 else pd.Timestamp(r["startDate"]).date().isoformat(),
+                    axis=1,
+                )
+                merged_parts = []
+                for (night, val), grp in zepp.groupby(["_night", "value"]):
+                    merged_parts.append(_merge_intervals(grp))
+                zepp_merged = pd.concat(merged_parts, ignore_index=True).drop(columns=["_night"], errors="ignore")
+                df = pd.concat([other, zepp_merged], ignore_index=True)
 
             # 4. Drop Zepp Life InBed records > 15h (device-on session, not real in-bed time)
             duration_h = (df["endDate"] - df["startDate"]).dt.total_seconds() / 3600
