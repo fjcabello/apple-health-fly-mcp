@@ -61,10 +61,10 @@ cd ~/Personal/apple_health/apple_health_mcp
 
 This single script:
 1. Runs `preprocess.py` (XML → `data/*.parquet`, ~20-25 files, one per metric type)
-2. Uploads every Parquet file to the Fly volume via `PUT /admin/upload/<filename>?api_key=...` (plain HTTPS — SSH/SFTP tunnels to Fly are blocked on this network)
-3. Calls `POST /admin/reload?api_key=...` to clear the in-memory cache, so the next tool call picks up the fresh data — no machine restart needed
+2. Uploads every Parquet file to the Fly volume via `PUT /admin/upload/<filename>` (key in the `x-api-key` header) (plain HTTPS — SSH/SFTP tunnels to Fly are blocked on this network)
+3. Calls `POST /admin/reload` to clear the in-memory cache, so the next tool call picks up the fresh data — no machine restart needed
 
-Both `/admin/*` routes require the `API_KEY` Fly secret as a query param (see `wrapper.py`). The key is read from `.fly_secret_local` (gitignored) or the environment.
+Both `/admin/*` routes require the `ADMIN_API_KEY` Fly secret (falls back to `API_KEY` when unset) in the `x-api-key` header (see `wrapper.py`). The script reads it as `API_KEY` from `.fly_secret_local` (gitignored) or the environment.
 
 ### 3. Automated sync via Health Auto Export
 
@@ -80,7 +80,7 @@ POST https://fjcabello-apple-health-mcp.fly.dev/ingest
 GET  https://fjcabello-apple-health-mcp.fly.dev/ingest/inspect   (last payload received, for debugging)
 ```
 
-Authentication: header `x-api-key: <secret>` or query param `?api_key=<secret>`, checked against the `INTERNAL_SECRET` Fly secret (kept equal to `API_KEY` for simplicity — set both with the same value). This is intentionally separate from the Cloudflare Worker's OAuth, since the iOS app can only set a header, not go through the OAuth flow.
+Authentication: header `x-api-key: <secret>` or query param `?api_key=<secret>`, checked against the `INTERNAL_SECRET` Fly secret. **Use a different value from `API_KEY`**: this one is stored on the phone (Health Auto Export) and only allows writing to `/ingest`, so a leak from the phone does not give read access to your data through `/mcp`. This is intentionally separate from the Cloudflare Worker's OAuth, since the iOS app can only set a header, not go through the OAuth flow.
 
 Configure **one automation per data type** in Health Auto Export (the app only allows one data type per automation): Health Metrics, Workouts, etc. — pick the metrics listed in `config.py` → `HK_TYPE_MAP`. Format JSON, export version v2, incremental date range, header `x-api-key` set to the shared secret.
 
@@ -97,8 +97,18 @@ fly auth login
 fly apps create fjcabello-apple-health-mcp
 fly volumes create apple_health_data --region ams --size 1 --app fjcabello-apple-health-mcp
 fly secrets set API_KEY=$(openssl rand -hex 32) --app fjcabello-apple-health-mcp
-fly secrets set INTERNAL_SECRET=<same value as API_KEY> --app fjcabello-apple-health-mcp
+fly secrets set INTERNAL_SECRET=$(openssl rand -hex 32) --app fjcabello-apple-health-mcp   # Health Auto Export only
+fly secrets set ADMIN_API_KEY=$(openssl rand -hex 32) --app fjcabello-apple-health-mcp     # sync_to_fly.sh only
 ```
+
+### Secrets and who holds each one
+
+| Fly secret | Held by | Grants |
+|---|---|---|
+| `API_KEY` | the Cloudflare Worker (`INTERNAL_SECRET` there) | `/mcp` (read your data) |
+| `ADMIN_API_KEY` | your Mac (`.fly_secret_local`) | `/admin/*` (overwrite Parquet files, reload). Falls back to `API_KEY` if unset |
+| `INTERNAL_SECRET` | the phone (Health Auto Export) | `/ingest` (write new samples) |
+| `ALLOW_QUERY_API_KEY` | — | `false` makes `/mcp` and `/admin/*` accept the key only in the `x-api-key` header, not as `?api_key=` (query strings end up in logs). Defaults to `true` for compatibility |
 
 ### Continuous deployment
 
