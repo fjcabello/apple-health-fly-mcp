@@ -37,8 +37,27 @@ if not API_KEY:
 DATA_DIR = Path(os.environ.get("APPLE_HEALTH_DATA_DIR", "/data"))
 
 
-def _valid_key(provided: str | None) -> bool:
-    return hmac.compare_digest((provided or "").encode(), API_KEY.encode())
+# Key for /admin/* (sync_to_fly.sh). Defaults to API_KEY; set ADMIN_API_KEY so the
+# key the Worker holds can read data but cannot overwrite the Parquet files.
+ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY") or API_KEY
+
+# The key travels in the x-api-key header. ?api_key= is still accepted for
+# compatibility until ALLOW_QUERY_API_KEY=false (query strings end up in logs).
+ALLOW_QUERY_API_KEY = os.environ.get("ALLOW_QUERY_API_KEY", "true").lower() != "false"
+
+
+def _provided_key(scope) -> str:
+    for name, value in scope.get("headers", []):
+        if name == b"x-api-key":
+            return value.decode("latin-1")
+    if ALLOW_QUERY_API_KEY:
+        params = dict(parse_qsl(scope.get("query_string", b"").decode()))
+        return params.get("api_key", "")
+    return ""
+
+
+def _valid_key(provided: str | None, expected: str = API_KEY) -> bool:
+    return hmac.compare_digest((provided or "").encode(), expected.encode())
 
 
 class RedactApiKey(logging.Filter):
@@ -54,7 +73,7 @@ class RedactApiKey(logging.Filter):
 
 
 async def upload_file(request: Request) -> PlainTextResponse:
-    if not _valid_key(request.query_params.get("api_key")):
+    if not _valid_key(_provided_key(request.scope), ADMIN_API_KEY):
         return PlainTextResponse("Unauthorized", status_code=401)
     filename = request.path_params["filename"]
     if "/" in filename or "\\" in filename or filename.startswith("."):
@@ -71,7 +90,7 @@ async def upload_file(request: Request) -> PlainTextResponse:
 
 
 async def reload_data(request: Request) -> JSONResponse:
-    if not _valid_key(request.query_params.get("api_key")):
+    if not _valid_key(_provided_key(request.scope), ADMIN_API_KEY):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     _cache.clear()
     return JSONResponse({"ok": True, "reloaded": True})
@@ -107,13 +126,13 @@ class RootApp:
             await self.ingest_app(scope, receive, send)
             return
 
-        params = dict(parse_qsl(scope.get("query_string", b"").decode()))
-        if not _valid_key(params.get("api_key")):
+        is_admin = scope["path"].startswith("/admin/")
+        if not _valid_key(_provided_key(scope), ADMIN_API_KEY if is_admin else API_KEY):
             response = JSONResponse({"error": "Unauthorized"}, status_code=401)
             await response(scope, receive, send)
             return
 
-        if scope["path"].startswith("/admin/"):
+        if is_admin:
             await self.admin_app(scope, receive, send)
             return
 
